@@ -4,6 +4,7 @@
 
 #include "particle-system.h"
 #include "vec3.h"
+#include "data-parser.h"
 
 
 int main() 
@@ -14,16 +15,16 @@ int main()
     // -----------------------------------
     // Parameters 
     constexpr char FILE_NAME[] = "lj.dat";  // output file name
-    constexpr int TOTAL_STEPS = 200;        // total steps
+    constexpr int TOTAL_STEPS = 500;        // total steps
     constexpr double dt = 0.0005;           // step time
     constexpr int writeEvery = 10;          // write to file every n steps
     
+    constexpr double Ttarget = 1.0;       // target temperature (lj)
+    constexpr double tau = 0.1;           // relaxation strength 
     constexpr double e = 1.0;             // epsilon (lj units)
     constexpr double sigma = 1.0;         // sigma (lj units)
     const double r0 = std::pow(2.0, 1.0 / 6.0) * sigma;
     const double a = std::sqrt(2.0) * r0;  // lattice constant ( = sqrt(2) * 1.122)
-    constexpr double Ttarget = 1.0;       // target temperature (lj)
-    constexpr double tau = 0.1;           // relaxation strength 
 
 
     // ==== initialize parameteres ====
