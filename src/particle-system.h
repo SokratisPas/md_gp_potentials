@@ -4,23 +4,10 @@
 #include <vector>
 #include <array>
 #include <random>
+#include <functional>
 
 #include "vec3.h"
-
-// =======================================
-// Particle Class
-struct Particle {
-    Vec3 position = Vec3(0.0);       // possition
-    Vec3 velocity = Vec3(0.0);       // velocity
-    Vec3 acceleration = Vec3(0.0);   // acceleration
-
-    Vec3 force = Vec3(0.0);          // force
-
-    Vec3 accelerationPrev = Vec3(0.0);   // previous acceleration
-
-    double mass = 1.0;                          // mass (lj)
-};
-
+#include "data-parser.h"
 
 // =======================================
 // Particle System Class
@@ -37,45 +24,35 @@ public:
     double density = 1.0;       // Density
     int dof = 1;                // degrees of Freedom
 
-    // Cube dimensions 
-    double xMin = 0.0, xMax = 1.0;
-    double yMin = 0.0, yMax = 1.0;
-    double zMin = 0.0, zMax = 1.0;
+    // box dimensions { a11, b22, c33 }
+    Vec3 boxVec = Vec3(0.0);
 
-    // vector of particles
-    std::vector<Particle> particles;
-
-    // each particle[i] has a vector that includes all the neighbor particles
-    std::vector<std::vector<int>> neighborList;
-
-    // last pos of particle[i] 
-    std::vector<Vec3> lastBuildPos;
+    std::vector<Snapshot> snapshots; // vector of snapshots
+    std::vector<Vec3> lastBuildPos; // last positions when neighborList was built
 
     // Constructor
-    explicit ParticleSystem(int in_partNumber)
+    explicit ParticleSystem(std::vector<Snapshot> snapshots)
+        : snapshots(std::move(snapshots))
     {
-        partNumber = in_partNumber;
+        if (this->snapshots.empty())
+        {
+            throw std::runtime_error("Error: Snapshots vector is empty.");
+        }
 
-        // degrees of freedom (we remove 3 bcz we remove net momentum)
-        dof = 3 * partNumber - 3;
-
-        particles.resize(partNumber);
-        neighborList.resize(partNumber);
-        lastBuildPos.resize(partNumber);
+        partNumber = this->snapshots[0].numberOfAtoms;
+        dof = 3 * partNumber - 3; // degrees of freedom (we remove 3 bcz we remove net momentum)
     }
     
     double randomDouble(double start, double finish);
-    std::vector<std::array<double, 3>> generateFCC(const int n, const double a);
-    void initializeParameteres(const double laticeConst);
+    void initializeParameteres();
     void removeNetMomentum();
     void applyPBC(Vec3& pos);
-    void buildNeighborList(const double rlist);
     Vec3 computeLJForce(
-        const Vec3& pi, 
-        const Vec3& pj, 
-        const double epsilon, 
-        const double sigma);
-    void computeForces_Epot_Virial(const double epsilon, const double sigma);
+        const Vec3& atom1Pos,
+        const Vec3& atom2Pos,
+        const double cutoff,
+        std::function<double(double)> forceFunc);
+    void computeForces(const double cutoff);
     void calcVolumeDensity();
     void initiallizeAcc();
     void resetEkinEpotVirial();
@@ -86,6 +63,8 @@ public:
     void computeTemperature();
     void computePressure();
     void useThermostat(const double Ttarget, const double tau, const double dt);
+    void buildNeighborList(const double rlist);
+    void calcVirial();
 };
 
 
@@ -99,62 +78,24 @@ double ParticleSystem::randomDouble(double start, double finish)
     return dist(gen);
 }
 
-// ----------------------------------------
-// particles positions in FCC latice
-std::vector<std::array<double, 3>> ParticleSystem::generateFCC(const int n, const double a)
-{
-    std::vector<std::array<double, 3>> positions;
-
-    // FCC has 4 atoms per unit cell
-    int cells_per_dim = std::ceil(std::cbrt(n / 4.0));
-
-    // Basis positions inside one FCC cell
-    std::vector<std::array<double, 3>> basis = {
-        {0.0, 0.0, 0.0},
-        {0.0, 0.5, 0.5},
-        {0.5, 0.0, 0.5},
-        {0.5, 0.5, 0.0}
-    };
-
-    for (int i = 0; i < cells_per_dim; i++) {
-        for (int j = 0; j < cells_per_dim; j++) {
-            for (int k = 0; k < cells_per_dim; k++) {
-
-                for (const auto& b : basis) {
-                    if (positions.size() >= n) return positions;
-
-                    positions.push_back({
-                        a * (i + b[0]),
-                        a * (j + b[1]),
-                        a * (k + b[2])
-                        });
-                }
-            }
-        }
-    }
-    return positions;
-}
-
 // ---------------------------------------------------
-// initialize Pos, Vel, lastBuildPos (NOT Acceleration)
-void ParticleSystem::initializeParameteres(const double laticeConst) 
+// initialize vel, box 
+void ParticleSystem::initializeParameteres() 
 {
-    // initial pos vector
-    std::vector<std::array<double, 3>> initialPos = 
-        generateFCC(partNumber, laticeConst); 
-
-    for (int i = 0; i < partNumber; i++)
+    for (auto& atom : snapshots[0].atoms)
     {
-        // initial pos
-        particles[i].position = Vec3(initialPos[i][0], initialPos[i][1], initialPos[i][2]);
+        atom.velocity = Vec3(randomDouble(-0.1, 0.1), 
+                                    randomDouble(-0.1, 0.1),
+                                    randomDouble(-0.1, 0.1));        
+    }
 
-        // initial small random vel
-        particles[i].velocity = Vec3(randomDouble(-0.1, 0.1), 
-                                        randomDouble(-0.1, 0.1),
-                                        randomDouble(-0.1, 0.1));
+    // initialize box, the lattice is orthogonal so only a11, b22, c33
+    boxVec = std::move(snapshots[0].box);
 
-        // initial lastBuildPos
-        lastBuildPos[i] = particles[i].position;
+    // initialize lastBuildPos
+    for (int i = 0; i < partNumber; ++i)
+    {
+        lastBuildPos.push_back(snapshots[0].atoms[i].position);
     }
 }
     
@@ -164,12 +105,12 @@ void ParticleSystem::initializeParameteres(const double laticeConst)
 void ParticleSystem::removeNetMomentum()
 {
     Vec3 velMean(0.0);
-    for (auto& p : particles)
+    for (auto& p : snapshots[0].atoms)
         velMean = velMean + p.velocity;
 
-    velMean = velMean / static_cast<double>(particles.size());
+    velMean = velMean / static_cast<double>(snapshots[0].atoms.size());
 
-    for (auto& p : particles)
+    for (auto& p : snapshots[0].atoms)
         p.velocity = p.velocity - velMean;
 }
     
@@ -177,202 +118,60 @@ void ParticleSystem::removeNetMomentum()
 // aplly PBC 
 void ParticleSystem::applyPBC(Vec3& pos)
 {
-    // cube lengths
-    double Lx = xMax - xMin;
-    double Ly = yMax - yMin;
-    double Lz = zMax - zMin;
-
     // keep x, y, x in cube boundaries 
-    pos.x = xMin + std::fmod(std::fmod(pos.x - xMin, Lx) + Lx, Lx);
-    pos.y = yMin + std::fmod(std::fmod(pos.y - yMin, Ly) + Ly, Ly);
-    pos.z = zMin + std::fmod(std::fmod(pos.z - zMin, Lz) + Lz, Lz);
-}
-    
-// ----------------------------------------
-// Build Neighbour List
-void ParticleSystem::buildNeighborList(const double rlist)
-{
-    double rlist2 = rlist * rlist;
-
-    int N = partNumber;
-
-    // clear neighborList
-    for (auto& nl : neighborList)
-        nl.clear();
-
-    // build cells (using rlist as cell size)
-    double cellSize = rlist;
-
-    // number of cels
-    int nx = static_cast<int>((xMax - xMin) / cellSize);
-    int ny = nx;
-    int nz = nx;
-
-    // debug line for n <= 0
-    if (nx <= 0 || ny <= 0 || nz <= 0)
-    {
-        throw std::runtime_error("Error: Number of cells some dim is non-positive.");
-    }
-
-    std::vector<std::vector<int>> cells(nx * ny * nz);
-
-    // make 1D coords to 3D coords
-    auto getCellIndex = [&](int ix, int iy, int iz)
-        {
-            return ix + nx * (iy + ny * iz);
-        };
-
-    // assign particles to cells
-    for (int i = 0; i < N; i++)
-    {
-        Vec3 p = particles[i].position;
-
-        // cells indices
-        int ix = static_cast<int>((p.x - xMin) / cellSize) % nx;
-        int iy = static_cast<int>((p.y - yMin) / cellSize) % ny;
-        int iz = static_cast<int>((p.z - zMin) / cellSize) % nz;
-
-        // catch negative indices
-        if (ix < 0) ix += nx;
-        if (iy < 0) iy += ny;
-        if (iz < 0) iz += nz;
-
-        cells[getCellIndex(ix, iy, iz)].push_back(i);
-    }
-
-    // build neighbor list
-    for (int ix = 0; ix < nx; ix++)
-        for (int iy = 0; iy < ny; iy++)
-            for (int iz = 0; iz < nz; iz++)
-            {
-                int cellA = getCellIndex(ix, iy, iz);
-
-                // check only neighbors of cellA
-                for (int dx = -1; dx <= 1; dx++)
-                    for (int dy = -1; dy <= 1; dy++)
-                        for (int dz = -1; dz <= 1; dz++)
-                        {
-                            int jx = (ix + dx + nx) % nx;
-                            int jy = (iy + dy + ny) % ny;
-                            int jz = (iz + dz + nz) % nz;
-
-                            int cellB = getCellIndex(jx, jy, jz);
-
-                            for (int i : cells[cellA])
-                            {
-                                for (int j : cells[cellB])
-                                {
-                                    // avoid double counting
-                                    if (i >= j) continue;
-
-                                    Vec3 r = particles[i].position - particles[j].position;
-
-                                    // minimum image
-                                    double Lx = xMax - xMin;
-                                    double Ly = yMax - yMin;
-                                    double Lz = zMax - zMin;
-
-                                    r.x -= Lx * std::round(r.x / Lx);
-                                    r.y -= Ly * std::round(r.y / Ly);
-                                    r.z -= Lz * std::round(r.z / Lz);
-
-                                    double dist2 = r.dot(r); // r * r
-
-                                    if (dist2 < rlist2)
-                                    {
-                                        neighborList[i].push_back(j);
-                                        neighborList[j].push_back(i);
-                                    }
-                                }
-                            }
-                        }
-            }
-
-    // store positions
-    for (int i = 0; i < N; i++)
-        lastBuildPos[i] = particles[i].position;
-}
+    pos.x = std::fmod(std::fmod(pos.x, boxVec.x) + boxVec.x, boxVec.x);
+    pos.y = std::fmod(std::fmod(pos.y, boxVec.y) + boxVec.y, boxVec.y);
+    pos.z = std::fmod(std::fmod(pos.z, boxVec.z) + boxVec.z, boxVec.z);
+}    
 
 // ----------------------------------------
-// particle-particle lj force
+// particle-particle 
 Vec3 ParticleSystem::computeLJForce(
-                        const Vec3& pi, 
-                        const Vec3& pj, 
-                        const double epsilon, 
-                        const double sigma)
+                    const Vec3& atom1Pos,
+                    const Vec3& atom2Pos,
+                    const double cutoff,
+                    std::function<double(double)> forceFunc)
 {
-    Vec3 r = pi - pj; // distance vec of pair
-
-    // box dimensions
-    double Lx = xMax - xMin;
-    double Ly = yMax - yMin;
-    double Lz = zMax - zMin;
-
-    // minimum image convention
-    // IDEA:
-    // use the smallest distance between 2 particles 
-    // r / L callc how many boxes is the distance 
-    // and we remove this distance from r
-    r.x -= Lx * std::round(r.x / Lx);
-    r.y -= Ly * std::round(r.y / Ly);
-    r.z -= Lz * std::round(r.z / Lz);
-
-    double dist2 = r.dot(r);
-
     // avoid division by zero 
-    if (dist2 < 1e-12)
+    Vec3 rij = atom1Pos - atom2Pos;
+    double distance = rij.length();
+
+    if (distance == 0.0)
         return Vec3(0.0);
         
     // cut off radius
-    double rc = 2.5 * sigma;
-    if (dist2 > (rc * rc))
+    if (distance > cutoff)
         return Vec3(0.0);
 
-    // distance magnitude
-    double dist = std::sqrt(dist2);
 
-    // inverse distance
-    double inv_r = 1.0 / std::sqrt(dist2);
+    double forceMagnitude = forceFunc(distance);
 
-    double s_over_r = sigma * inv_r;
-    double s2 = s_over_r * s_over_r;
-    double s6 = s2 * s2 * s2;
-    double s12 = s6 * s6;
-
-    // E potential update
-    Epot += 4.0 * epsilon * (s12 - s6);
-
-    // LJ force magnitude
-    double f = 24.0 * epsilon * (2.0 * s12 - s6) * inv_r;
-
-    return r * (f * inv_r);
+    return rij * (forceMagnitude / distance); // force vector
 }
 
 // ----------------------------------------
 // calc all lj forces and Epot and Virial 
-void ParticleSystem::computeForces_Epot_Virial(const double epsilon, const double sigma)
+void ParticleSystem::computeForces(const double cutoff)
 {
-    int N = partNumber;
-
-    // set forces = 0
-    for (auto& p : particles)
-        p.force = Vec3(0.0);
-
-    // calc new lj forces
-    for (int i = 0; i < N; i++)
+    for (int i = 0; i < partNumber; ++i)
     {
-        for (int j : neighborList[i])
+        snapshots[0].atoms[i].force = Vec3(0.0);
+
+        for (auto& neighbor : snapshots[0].neighborLists[i])
         {
-            if (i >= j) continue;
+            Vec3 ijForce = computeLJForce(
+                snapshots[0].atoms[i].position,
+                neighbor.position,
+                cutoff,
+                [](double r) {
+                    double r2 = r * r;
+                    double r6 = r2 * r2 * r2;
+                    double r12 = r6 * r6;
+                    return 24.0 * (2.0 / r12 - 1.0 / r6) / r; // derivative of LJ potential
+                }
+            );
 
-            Vec3 ijForce = computeLJForce(particles[i].position, particles[j].position, epsilon, sigma);
-
-            particles[i].force = particles[i].force + ijForce;
-            particles[j].force = particles[j].force - ijForce;
-
-
-            Vec3 rij = particles[i].position - particles[j].position;
-            virial += rij.dot(ijForce);
+            snapshots[0].atoms[i].force = snapshots[0].atoms[i].force + ijForce;
         }
     }
 }
@@ -381,18 +180,18 @@ void ParticleSystem::computeForces_Epot_Virial(const double epsilon, const doubl
 // calc volume, density
 void ParticleSystem::calcVolumeDensity()
 {
-    double volume = (xMax - xMin) * (yMax - yMin) * (zMax - zMin);
-    double density = partNumber / volume;
+    volume = boxVec.x * boxVec.y * boxVec.z;
+    density = partNumber / volume;
 }
 
 // ----------------------------------------
 // initiallize acceleration
 void ParticleSystem::initiallizeAcc()
 {
-    for (auto& p : particles)
+    for (auto& atom : snapshots[0].atoms)
     {
-        p.acceleration = p.force;       // m = 1
-        p.accelerationPrev = p.force;   // m = 1
+        atom.acceleration = atom.force / atom.mass;   
+        atom.accelerationPrev = atom.force / atom.mass;   
     }
 }
 
@@ -407,16 +206,16 @@ void ParticleSystem::resetEkinEpotVirial()
 // update pos wth velocity Verlet method
 void ParticleSystem::updatePos(const double dt)
 {
-    for (auto& part : particles)
+    for (auto& atom : snapshots[0].atoms)
     {
-        part.position = part.position + part.velocity * dt +
-            part.accelerationPrev * 0.5 * (dt * dt);
+        atom.position = atom.position + atom.velocity * dt +
+            atom.accelerationPrev * 0.5 * (dt * dt);
 
         // periodic boundary conditions
-        applyPBC(part.position);
+        applyPBC(atom.position);
 
         // save prev acceleration
-        part.accelerationPrev = part.acceleration;
+        atom.accelerationPrev = atom.acceleration;
     }
 }
 
@@ -425,23 +224,17 @@ void ParticleSystem::updatePos(const double dt)
 // IDEA: If any particle has moved (distance > rs / 2), we rebuild the neighborList
 bool ParticleSystem::needRebuild(const double skin)
 {
-    int N = partNumber;
-
     // max displacement^2 of any particle
     double maxDisp2 = 0.0;
 
-    for (int i = 0; i < N; i++)
+    for (int i = 0; i < partNumber; i++)
     {
-        Vec3 dr = particles[i].position - lastBuildPos[i];
+        Vec3 dr = snapshots[0].atoms[i].position - lastBuildPos[i];
 
         // minimum image
-        double Lx = xMax - xMin;
-        double Ly = yMax - yMin;
-        double Lz = zMax - zMin;
-
-        dr.x -= Lx * std::round(dr.x / Lx);
-        dr.y -= Ly * std::round(dr.y / Ly);
-        dr.z -= Lz * std::round(dr.z / Lz);
+        dr.x -= boxVec.x * std::round(dr.x / boxVec.x);
+        dr.y -= boxVec.y * std::round(dr.y / boxVec.y);
+        dr.z -= boxVec.z * std::round(dr.z / boxVec.z);
 
         maxDisp2 = std::max(maxDisp2, dr.dot(dr));
     }
@@ -453,9 +246,9 @@ bool ParticleSystem::needRebuild(const double skin)
 // acceleration update
 void ParticleSystem::updateAcc()
 {
-    for (auto& part : particles)
+    for (auto& atom : snapshots[0].atoms)
     {
-        part.acceleration = part.force; // m = 1
+        atom.acceleration = atom.force / atom.mass; 
     }
 }
 
@@ -463,12 +256,12 @@ void ParticleSystem::updateAcc()
 // vel and Ekin update
 void ParticleSystem::updateVelEkin(const double dt)
 {
-    for (auto& part : particles)
+    for (auto& atom : snapshots[0].atoms)
     {
-        part.velocity = 
-            part.velocity + (part.accelerationPrev + part.acceleration) * 0.5 * dt;
+        atom.velocity = 
+            atom.velocity + (atom.accelerationPrev + atom.acceleration) * 0.5 * dt;
 
-        Ekin += 0.5 * part.velocity.dot(part.velocity); // m = 1
+        Ekin += 0.5 * atom.mass * atom.velocity.dot(atom.velocity); 
     }
 }
 
@@ -504,7 +297,82 @@ void ParticleSystem::useThermostat(const double Ttarget, const double tau, const
     double lambda = std::sqrt(1.0 + (dt / tau) * (Ttarget / temperature - 1.0));
 
     // change velocity of particles
-    for (auto& p : particles)
-        p.velocity = p.velocity * lambda;
+    for (auto& atom : snapshots[0].atoms)
+        atom.velocity = atom.velocity * lambda;
 }
 
+// ----------------------------------------
+void ParticleSystem::buildNeighborList(const double rlist)
+{
+    snapshots[0].neighborLists.assign(partNumber, {});
+
+    for (std::size_t i = 0; i < partNumber; ++i)
+    {
+        for (std::size_t j = 0; j < partNumber; ++j)
+        {
+            if (i == j)
+                continue;
+
+            Vec3 dr;
+
+            dr.x =
+                snapshots[0].atoms[j].position.x -
+                snapshots[0].atoms[i].position.x;
+
+            dr.y =
+                snapshots[0].atoms[j].position.y -
+                snapshots[0].atoms[i].position.y;
+
+            dr.z =
+                snapshots[0].atoms[j].position.z -
+                snapshots[0].atoms[i].position.z;
+
+            // Minimum image convention
+            dr.x -= snapshots[0].box.x *
+                    std::round(dr.x / snapshots[0].box.x);
+
+            dr.y -= snapshots[0].box.y *
+                    std::round(dr.y / snapshots[0].box.y);
+
+            dr.z -= snapshots[0].box.z *
+                    std::round(dr.z / snapshots[0].box.z);
+
+            // Distance
+            double distance =
+                std::sqrt(
+                    dr.x * dr.x +
+                    dr.y * dr.y +
+                    dr.z * dr.z
+                );
+
+
+            // Cutoff rlist = rc + rSkin
+            if (distance <= rlist)
+            {
+                snapshots[0].neighborLists[i].push_back(snapshots[0].atoms[j]);
+            }
+        }
+    }
+}
+
+// ----------------------------------------
+void ParticleSystem::calcVirial()
+{
+    virial = 0.0;
+
+    for (int i = 0; i < partNumber; ++i)
+    {
+        for (auto& neighbor : snapshots[0].neighborLists[i])
+        {
+            Vec3 dr = snapshots[0].atoms[i].position - neighbor.position;
+
+            // Minimum image convention
+            dr.x -= snapshots[0].box.x * std::round(dr.x / snapshots[0].box.x);
+            dr.y -= snapshots[0].box.y * std::round(dr.y / snapshots[0].box.y);
+            dr.z -= snapshots[0].box.z * std::round(dr.z / snapshots[0].box.z);
+
+            // dr_ij * Fij
+            virial += dr.dot(snapshots[0].atoms[i].force);
+        }
+    }
+}

@@ -12,26 +12,28 @@
 
 
 // =============================================================
-struct Neighbor
-{
-    std::string type;
-    double distance;
-};
-
-// =============================================================
 struct Atom
 {
-    std::string type;
-    Vec3 position;
-    std::vector<Neighbor> neighbors;
+    std::string type = "None";
+
+    Vec3 position = Vec3(0.0);    
+    Vec3 velocity = Vec3(0.0);     
+    Vec3 acceleration = Vec3(0.0);   
+    Vec3 force = Vec3(0.0);       
+
+    Vec3 accelerationPrev = Vec3(0.0);   // previous acceleration
+
+    double mass = 1.0;                   // mass (lj)
 };
 
 // =============================================================
 struct Snapshot
 {
     int numberOfAtoms;
-    Vec3 box;
     std::vector<Atom> atoms;
+    std::vector<std::vector<Atom>> neighborLists; // vector of neighbors for each atom
+
+    Vec3 box;
     std::string configType;
     double energy;
 };
@@ -72,44 +74,84 @@ std::vector<Snapshot> XYZParser::parse(const std::string& filename)
         );
     }
 
-    std::vector<Snapshot> snapshots;
-
+    std::vector<std::string> lines;
     std::string line;
 
     while (std::getline(file, line))
     {
-        // Skip empty lines
-        if (line.empty())
-            continue;
+        if (!line.empty())
+            lines.push_back(line);
+    }
 
-        // number of atoms
-        int numberOfAtoms = std::stoi(line);
+    std::vector<Snapshot> snapshots;
 
-        
-        // Metadata line (we read only energy, config_type, and lattice(box))
-        if (!std::getline(file, line))
-            throw std::runtime_error(
-                "Unexpected end of file while reading metadata."
-            );
+    std::size_t i = 0;
+    while (i < lines.size())
+    {
+        const std::string& currentLine = lines[i];
 
-        Snapshot snapshot;
+        std::string metadataLine = currentLine;
+        int numberOfAtoms = 0;
 
-        snapshot.numberOfAtoms = numberOfAtoms;
-        snapshot.box = parseLattice(line);
-        snapshot.configType = parseConfigType(line);
-        snapshot.energy = parseEnergy(line);
-
-        snapshot.atoms.reserve(numberOfAtoms);
-
-        // Read atoms
-        for (int i = 0; i < numberOfAtoms; ++i)
+        std::stringstream firstTokenStream(currentLine);
+        std::string firstToken;
+        if (firstTokenStream >> firstToken &&
+            std::all_of(firstToken.begin(), firstToken.end(), [](unsigned char ch)
+            {
+                return std::isdigit(ch);
+            }))
         {
-            if (!std::getline(file, line))
+            numberOfAtoms = std::stoi(firstToken);
+            ++i;
+
+            if (i >= lines.size())
                 throw std::runtime_error(
-                    "Unexpected end of file while reading atoms."
+                    "Unexpected end of file while reading metadata."
                 );
 
-            std::stringstream ss(line);
+            metadataLine = lines[i];
+        }
+
+        if (metadataLine.find("Lattice=") == std::string::npos &&
+            metadataLine.find("Properties=") == std::string::npos)
+        {
+            throw std::runtime_error(
+                "Unexpected metadata line: " + metadataLine
+            );
+        }
+
+        Snapshot snapshot;
+        snapshot.numberOfAtoms = numberOfAtoms;
+        snapshot.box = parseLattice(metadataLine);
+        snapshot.configType = parseConfigType(metadataLine);
+        snapshot.energy = parseEnergy(metadataLine);
+
+        std::size_t atomStart = i + 1;
+        std::size_t atomEnd = atomStart;
+
+        if (numberOfAtoms > 0)
+        {
+            atomEnd = std::min(atomStart + static_cast<std::size_t>(numberOfAtoms), lines.size());
+        }
+        else
+        {
+            while (atomEnd < lines.size())
+            {
+                const std::string& candidate = lines[atomEnd];
+                if (candidate.find("Lattice=") != std::string::npos ||
+                    candidate.find("Properties=") != std::string::npos)
+                {
+                    break;
+                }
+                ++atomEnd;
+            }
+        }
+
+        snapshot.atoms.reserve(static_cast<std::size_t>(std::max(numberOfAtoms, static_cast<int>(atomEnd - atomStart))));
+
+        for (std::size_t atomIndex = atomStart; atomIndex < atomEnd; ++atomIndex)
+        {
+            std::stringstream ss(lines[atomIndex]);
 
             Atom atom;
 
@@ -119,21 +161,37 @@ std::vector<Snapshot> XYZParser::parse(const std::string& filename)
                 >> atom.position.y
                 >> atom.position.z;
 
-            Vec3 force;     // read force (not used)
+            Vec3 force;
             ss >> force.x
                 >> force.y
                 >> force.z;
 
-            int atomicNumber;   // Read atomic number (not used)
-            ss >> atomicNumber; 
+            int atomicNumber = 0;
+            ss >> atomicNumber;
 
             snapshot.atoms.push_back(atom);
         }
 
-        // Calculate neighbors
-        buildNeighborLists(snapshot);
+        if (numberOfAtoms > 0 && static_cast<int>(snapshot.atoms.size()) != numberOfAtoms)
+        {
+            throw std::runtime_error(
+                "Expected " + std::to_string(numberOfAtoms) +
+                " atoms but found " + std::to_string(snapshot.atoms.size()) +
+                " in file: " + filename
+            );
+        }
 
+        snapshot.numberOfAtoms = static_cast<int>(snapshot.atoms.size());
+
+        buildNeighborLists(snapshot);
         snapshots.push_back(snapshot);
+
+        i = atomEnd;
+    }
+
+    if (snapshots.empty())
+    {
+        throw std::runtime_error("No valid snapshots found in file: " + filename);
     }
 
     return snapshots;
@@ -145,9 +203,7 @@ Vec3 XYZParser::parseLattice(const std::string& line)
     std::size_t start = line.find("Lattice=\"");
 
     if (start == std::string::npos)
-        throw std::runtime_error(
-            "Lattice information not found."
-        );
+        throw std::runtime_error("Lattice information not found.");
 
     start += 9;
 
@@ -228,11 +284,12 @@ double XYZParser::parseEnergy(const std::string& line)
 // ------------------------------------------------
 void XYZParser::buildNeighborLists(Snapshot& snapshot)
 {
-    const int N = snapshot.numberOfAtoms;
+    const std::size_t atomCount = snapshot.atoms.size();
+    snapshot.neighborLists.assign(atomCount, {});
 
-    for (int i = 0; i < N; ++i)
+    for (std::size_t i = 0; i < atomCount; ++i)
     {
-        for (int j = 0; j < N; ++j)
+        for (std::size_t j = 0; j < atomCount; ++j)
         {
             if (i == j)
                 continue;
@@ -273,16 +330,7 @@ void XYZParser::buildNeighborLists(Snapshot& snapshot)
             // Cutoff
             if (distance <= cutoff)
             {
-                Neighbor neighbor;
-
-                neighbor.type =
-                    snapshot.atoms[j].type;
-
-                neighbor.distance = distance;
-
-                snapshot.atoms[i]
-                    .neighbors
-                    .push_back(neighbor);
+                snapshot.neighborLists[i].push_back(snapshot.atoms[j]);
             }
         }
     }
