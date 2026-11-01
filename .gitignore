@@ -1,0 +1,11 @@
+build/
+output/*
+!output/.gitkeep
+input/*
+!input/.gitkeep
+.vscode/
+*.o
+*.out
+.dat
+.xyz
+.txt
