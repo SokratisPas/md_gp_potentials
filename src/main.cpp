@@ -5,13 +5,8 @@
 #include "particle-system.h"
 #include "vec3.h"
 #include "data-parser.h"
+#include "potentials-forces.h"
 
-/*
-TO DO:
-- include in gitignore the executable file.
-- check the input in main
-
-*/
 
 int main(int argc, char* argv[]) 
 {    
@@ -67,7 +62,7 @@ int main(int argc, char* argv[])
     XYZParser parser(rlist);
     std::vector<Snapshot> snapshots = parser.parse(inputFilePath.string());
         
-    ParticleSystem particleSystem(snapshots); 
+    ParticleSystem particleSystem(snapshots, ljForceFunction, ljPotentialFunction);
     
     // ==== initialize parameteres ====
     particleSystem.initializeParameteres();
@@ -134,6 +129,7 @@ int main(int argc, char* argv[])
 
         // update forces 
         particleSystem.computeForces(rc);
+        particleSystem.computeEpot(rc);
 
         // acceleration update
         particleSystem.updateAcc();

@@ -23,6 +23,8 @@ public:
     double volume = 1.0;        // volume
     double density = 1.0;       // Density
     int dof = 1;                // degrees of Freedom
+    std::function<double(double)> forceFunc;
+    std::function<double(double)> potentialFunc;
 
     // box dimensions { a11, b22, c33 }
     Vec3 boxVec = Vec3(0.0);
@@ -31,8 +33,12 @@ public:
     std::vector<Vec3> lastBuildPos; // last positions when neighborList was built
 
     // Constructor
-    explicit ParticleSystem(std::vector<Snapshot> snapshots)
-        : snapshots(std::move(snapshots))
+    explicit ParticleSystem(
+        std::vector<Snapshot> snapshots,
+        std::function<double(double)> forceFunc,
+        std::function<double(double)> potentialFunc
+    )
+        :forceFunc(forceFunc), potentialFunc(potentialFunc), snapshots(std::move(snapshots))
     {
         if (this->snapshots.empty())
         {
@@ -53,6 +59,7 @@ public:
         const double cutoff,
         std::function<double(double)> forceFunc);
     void computeForces(const double cutoff);
+    void computeEpot(const double cutoff);
     void calcVolumeDensity();
     void initiallizeAcc();
     void resetEkinEpotVirial();
@@ -127,10 +134,11 @@ void ParticleSystem::applyPBC(Vec3& pos)
 // ----------------------------------------
 // particle-particle 
 Vec3 ParticleSystem::computeLJForce(
-                    const Vec3& atom1Pos,
-                    const Vec3& atom2Pos,
-                    const double cutoff,
-                    std::function<double(double)> forceFunc)
+    const Vec3& atom1Pos,
+    const Vec3& atom2Pos,
+    const double cutoff,
+    std::function<double(double)> forceFunc
+)
 {
     // avoid division by zero 
     Vec3 rij = atom1Pos - atom2Pos;
@@ -163,15 +171,39 @@ void ParticleSystem::computeForces(const double cutoff)
                 snapshots[0].atoms[i].position,
                 neighbor.position,
                 cutoff,
-                [](double r) {
-                    double r2 = r * r;
-                    double r6 = r2 * r2 * r2;
-                    double r12 = r6 * r6;
-                    return 24.0 * (2.0 / r12 - 1.0 / r6) / r; // derivative of LJ potential
-                }
+                forceFunc
             );
 
             snapshots[0].atoms[i].force = snapshots[0].atoms[i].force + ijForce;
+        }
+    }
+}
+
+// ----------------------------------------
+// calculate Lennard-Jones potential energy
+void ParticleSystem::computeEpot(const double cutoff)
+{
+    Epot = 0.0;
+
+    const auto& atoms = snapshots[0].atoms;
+    for (int i = 0; i < partNumber; ++i)
+    {
+        for (int j = i + 1; j < partNumber; ++j)
+        {
+            Vec3 rij = atoms[i].position - atoms[j].position;
+
+            // Minimum image convention
+            rij.x -= boxVec.x * std::round(rij.x / boxVec.x);
+            rij.y -= boxVec.y * std::round(rij.y / boxVec.y);
+            rij.z -= boxVec.z * std::round(rij.z / boxVec.z);
+
+            const double distance = rij.length();
+            if (distance > cutoff)
+                continue;
+            if (distance == 0.0)
+                throw std::runtime_error("Cannot compute Lennard-Jones energy at zero separation.");
+
+            Epot += potentialFunc(distance);
         }
     }
 }
