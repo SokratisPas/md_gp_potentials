@@ -3,9 +3,9 @@ output/*
 !output/.gitkeep
 input/*
 !input/.gitkeep
+!input/dataExample.txt
 .vscode/
 *.o
 *.out
 .dat
-.xyz
 .txt
